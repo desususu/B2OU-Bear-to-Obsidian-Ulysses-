@@ -8,10 +8,11 @@ import objc
 import os
 import base64
 from AppKit import NSWorkspace, NSWorkspaceOpenConfiguration, NSURL
+from Foundation import NSFileManager, NSDate, NSFileCreationDate
 
 '''
 # Markdown export from Bear sqlite database
-Version 1.4-optimized
+Version 1.5-inplace
 modified by: github/andymatuschak, andy_matuschak@twitter
 original author: github/rovest, rorves@twitter
 '''
@@ -27,8 +28,8 @@ import re
 import subprocess
 import urllib.parse
 import time
+import tempfile
 import shutil
-import fnmatch
 import json
 import argparse
 
@@ -44,6 +45,9 @@ RE_BEAR_ID_FIND_NEW = re.compile(r'\[\/\/\]: # \(\{BearID:(.+?)\}\)')
 RE_BEAR_ID_FIND_OLD = re.compile(r'\<\!-- ?\{BearID\:(.+?)\} ?--\>')
 RE_MD_IMAGE      = re.compile(r'!\[(.*?)\]\(([^)]+)\)')
 RE_WIKI_IMAGE    = re.compile(r'!\[\[(.*?)\]\]')
+RE_HTML_IMG_TAG  = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+RE_HTML_IMG_SRC  = re.compile(r'\bsrc=(["\'])(.*?)\1', re.IGNORECASE)
+RE_HTML_IMG_ALT  = re.compile(r'\balt=(["\'])(.*?)\1', re.IGNORECASE)
 RE_BEAR_IMAGE    = re.compile(r'\[image:(.+?)\]')
 RE_BEAR_IMG_SUB  = re.compile(r'\[image:(.+?)/(.+?)\]')
 RE_TAG_PATTERN1  = re.compile(r'(?<!\S)\#([.\w\/\-]+)[ \n]?(?!([\/ \w]+\w[#]))')
@@ -51,6 +55,8 @@ RE_TAG_PATTERN2  = re.compile(r'(?<![\S])\#([^ \d][.\w\/ ]+?)\#([ \n]|$)')
 RE_REF_DEF       = re.compile(r'^\[(?!\/\/)([^\]]+)\]:\s*(\S+).*$', re.MULTILINE)
 RE_REF_IMG       = re.compile(r'!\[([^\]]*)\]\[([^\]]+)\]')
 RE_REF_IMP       = re.compile(r'!\[([^\[\]]+)\](?!\()')
+RE_REF_LINK      = re.compile(r'(?<!!)\[([^\]]+)\]\[([^\]]+)\]')   # [text][ref] (non-image)
+RE_REF_LINK_IMP  = re.compile(r'(?<!!)\[([^\[\]]+)\](?!\(|\[|:)')  # [text] implicit (non-image)
 RE_REF_CLEAN     = re.compile(r'^\[(?!\/\/)[^\]]+\]:\s*\S+.*$\n?', re.MULTILINE)
 RE_HIDE_TAGS     = re.compile(r'(\n)[ \t]*(\#[^\s#].*)')
 RE_HEADING       = re.compile(r'^#{1,6} ')
@@ -62,6 +68,7 @@ RE_TB_ASSET_IMG  = re.compile(r'!\[(.*?)\]\(assets/.+?_(.+?)( ".+?")?\) ?')
 RE_CLEAN_TITLE   = re.compile(r'[\/\\:]')
 RE_TRAILING_DASH = re.compile(r'-$')
 RE_IMAGE_UUID_PREFIX = re.compile(r'[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}', re.IGNORECASE)
+_IMAGE_FILE_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.bmp', '.tif', '.tiff')
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -96,9 +103,7 @@ set_logging_on          = True
 export_path             = parsed_args.get("out")
 no_export_tags          = parsed_args.get("excludeTag")
 hide_tags_in_comment_block = parsed_args.get("hideTags")
-multi_export            = [(export_path, True)]
 
-temp_path    = os.path.join(HOME, 'Temp', 'BearExportTemp')
 bear_db      = os.path.join(HOME,
     'Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data/database.sqlite')
 sync_backup  = parsed_args.get("backup")
@@ -112,9 +117,7 @@ sync_ts      = '.sync-time.log'
 export_ts    = '.export-time.log'
 
 sync_ts_file       = os.path.join(export_path, sync_ts)
-sync_ts_file_temp  = os.path.join(temp_path,   sync_ts)
 export_ts_file_exp = os.path.join(export_path, export_ts)
-export_ts_file     = os.path.join(temp_path,   export_ts)
 
 gettag_sh  = os.path.join(HOME, 'temp/gettag.sh')
 gettag_txt = os.path.join(HOME, 'temp/gettag.txt')
@@ -136,13 +139,15 @@ def main():
         # Import-only mode: no export, no timestamp update.
         exit(0)
     if check_db_modified():
-        delete_old_temp_files()
-        note_count = export_markdown()
+        os.makedirs(export_path, exist_ok=True)
+        note_count, expected_paths = export_markdown()
         write_time_stamp()
-        rsync_files_from_temp()
-        # copy_bear_images() is removed: process_image_links() now copies
-        # images directly and incrementally during the export loop itself,
-        # so there is no longer a need for a separate rsync of the image store.
+        removed = _cleanup_stale_notes(expected_paths)
+        if removed:
+            print(f'Cleaned {removed} stale files from export folder')
+        removed_orphan_images = _cleanup_root_orphan_images()
+        if removed_orphan_images:
+            print(f'Cleaned {removed_orphan_images} orphan root images')
         write_log(str(note_count) + ' notes exported to: ' + export_path)
         exit(1)
     else:
@@ -204,9 +209,8 @@ def check_db_modified():
 
 def write_file(filename, file_content, modified, created):
     # Record whether the file is new *before* we (re-)create it.
-    # SetFile sets the Finder creation date and costs ~50 ms per call
-    # (a full subprocess spawn). For existing files the creation date
-    # is already correct, so we only pay that cost once per new note.
+    # The creation date is set via native macOS API (NSFileManager) for
+    # new files only — existing files already have the correct date.
     is_new_file = not os.path.exists(filename)
 
     with open(filename, "w", encoding='utf-8') as f:
@@ -214,11 +218,27 @@ def write_file(filename, file_content, modified, created):
     if modified > 0:
         os.utime(filename, (-1, modified))
     if created > 0 and is_new_file:
-        newnum   = dt_conv(created)
-        dtdate   = datetime.datetime.fromtimestamp(newnum)
-        datestr  = dtdate.strftime("%m/%d/%Y %H:%M:%S")
-        command  = 'SetFile -d "' + datestr + '" ' + shlex.quote(filename)
-        subprocess.call(command, shell=True)
+        _set_creation_date(filename, dt_conv(created))
+
+
+def _set_creation_date(filepath, unix_timestamp):
+    """
+    Set the file's creation date (birthtime) using macOS Foundation API.
+
+    Replaces the old `SetFile -d` subprocess call (~50ms per invocation)
+    with a direct NSFileManager attribute write (<1ms, zero process
+    overhead).  For a sync of 20 new files, this saves ~1 second.
+
+    The Foundation framework is part of pyobjc-framework-Cocoa, which
+    is already a dependency (AppKit is imported at the top of this file).
+    """
+    try:
+        ns_date = NSDate.dateWithTimeIntervalSince1970_(unix_timestamp)
+        attrs = {NSFileCreationDate: ns_date}
+        NSFileManager.defaultManager().setAttributes_ofItemAtPath_error_(
+            attrs, filepath, None)
+    except Exception as e:
+        print(f"Warning: native creation date failed for {filepath}: {e}")
 
 
 def read_file(file_name):
@@ -233,47 +253,223 @@ def clean_title(title):
     return title.strip()
 
 
+def _is_under_dir(path, parent):
+    """True if *path* is inside *parent* (both resolved, normalized)."""
+    try:
+        real_path = os.path.realpath(path)
+        real_parent = os.path.realpath(parent)
+        return os.path.commonpath([real_path, real_parent]) == real_parent
+    except Exception:
+        return False
+
+
+def _normalize_local_image_ref(raw_url):
+    """Normalize image URL/path from markdown or HTML src into a local path token."""
+    if raw_url is None:
+        return ""
+    url = urllib.parse.unquote(str(raw_url)).strip()
+    if not url:
+        return ""
+
+    # Strip optional title from markdown image syntax: path "title"
+    # / path 'title' — keep only the path segment.
+    for quote in ('"', "'"):
+        if quote in url:
+            q = url.find(quote)
+            head = url[:q].rstrip()
+            if head:
+                url = head
+                break
+
+    if url.startswith("<") and url.endswith(">"):
+        url = url[1:-1].strip()
+
+    if url.lower().startswith("file://"):
+        parsed = urllib.parse.urlparse(url)
+        fp = urllib.parse.unquote(parsed.path or "")
+        if fp:
+            return fp
+    return url
+
+
+def _convert_html_img_to_markdown(md_text):
+    """Convert HTML <img ... src=...> tags to markdown image syntax."""
+    def _replace(tag_match):
+        tag = tag_match.group(0)
+        src_m = RE_HTML_IMG_SRC.search(tag)
+        if not src_m:
+            return tag
+        src = (src_m.group(2) or '').strip()
+        if not src:
+            return tag
+        alt_m = RE_HTML_IMG_ALT.search(tag)
+        alt = (alt_m.group(2) if alt_m else "image").strip() or "image"
+        alt = alt.replace(']', r'\]')
+        return f"![{alt}]({src})"
+
+    return RE_HTML_IMG_TAG.sub(_replace, md_text)
+
+
 # ===========================================================================
 # Export phase helpers
 # ===========================================================================
 
-def delete_old_temp_files():
-    if os.path.exists(temp_path) and "BearExportTemp" in temp_path:
-        shutil.rmtree(temp_path)
-    os.makedirs(temp_path)
+# ---------------------------------------------------------------------------
+# Stale-file cleanup (replaces rsync --delete)
+# ---------------------------------------------------------------------------
+
+_CLEANUP_SKIP_DIRS = frozenset({
+    'BearImages', '.obsidian',
+})
+_CLEANUP_SKIP_DIR_PREFIXES = ('.Ulysses',)
+_CLEANUP_SKIP_FILES = frozenset({
+    '.sync-time.log', '.export-time.log',
+})
 
 
-def rsync_files_from_temp():
-    for (dest_path, delete) in multi_export:
-        os.makedirs(dest_path, exist_ok=True)
-        if delete:
-            subprocess.call(['rsync', '-r', '-t', '--crtimes', '-E', '--delete',
-                             '--exclude', 'BearImages/',
-                             '--exclude', '.obsidian/',
-                             '--exclude', '.Ulysses*',
-                             '--exclude', '*.Ulysses_Public_Filter',
-                             temp_path + "/", dest_path])
-        else:
-            subprocess.call(['rsync', '-r', '-t', '-E',
-                             temp_path + "/", dest_path])
+def _cleanup_stale_notes(expected_paths: set) -> int:
+    """Remove exported note files/bundles no longer in Bear.
+
+    Walks export_path once, skipping excluded directories (BearImages,
+    .obsidian, .Ulysses*) and sentinel files.  Anything that looks like
+    a note file or textbundle that is NOT in *expected_paths* is deleted.
+    """
+    if not os.path.isdir(export_path):
+        return 0
+    removed = 0
+    empty_dirs = []
+
+    for root, dirs, files in os.walk(export_path, topdown=True):
+        keep = []
+        for d in dirs:
+            if d in _CLEANUP_SKIP_DIRS:
+                continue
+            if any(d.startswith(pfx) for pfx in _CLEANUP_SKIP_DIR_PREFIXES):
+                continue
+            if d.endswith('.Ulysses_Public_Filter'):
+                continue
+            if d.endswith('.textbundle'):
+                bundle_path = os.path.join(root, d)
+                if bundle_path not in expected_paths:
+                    try:
+                        shutil.rmtree(bundle_path)
+                        removed += 1
+                    except OSError:
+                        pass
+                continue  # don't descend into textbundles either way
+            keep.append(d)
+        dirs[:] = keep
+
+        for fname in files:
+            if fname in _CLEANUP_SKIP_FILES:
+                continue
+            fpath = os.path.join(root, fname)
+            if fpath in expected_paths:
+                continue
+            if any(fname.endswith(ext) for ext in ('.md', '.txt', '.markdown')):
+                try:
+                    os.remove(fpath)
+                    removed += 1
+                except OSError:
+                    pass
+
+        if root != export_path:
+            empty_dirs.append(root)
+
+    # Clean up empty tag directories (deepest first)
+    for d in reversed(sorted(empty_dirs)):
+        try:
+            if os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+        except OSError:
+            pass
+
+    return removed
 
 
-# copy_bear_images() has been removed.
-#
-# The old approach synced the entire bear_image_path directory via rsync.
-# It was broken by a timestamp race: write_time_stamp() + rsync updated
-# export_ts_file_exp to "now" before the find-newer check ran, so every
-# existing image appeared older than the reference file, and rsync was
-# always skipped for Bear-added images.
-#
-# Image copying is now handled directly inside process_image_links() using
-# an incremental mtime check per file, which is both correct and faster.
+def _collect_referenced_local_images(root_path):
+    """Collect absolute local image paths referenced by notes in *root_path*."""
+    refs = set()
+    if not os.path.isdir(root_path):
+        return refs
+
+    for root, dirs, files in os.walk(root_path, topdown=True):
+        dirs[:] = [d for d in dirs
+                   if d not in _CLEANUP_SKIP_DIRS
+                   and d != '.git'
+                   and d != '__pycache__'
+                   and not any(d.startswith(pfx) for pfx in _CLEANUP_SKIP_DIR_PREFIXES)]
+
+        for fname in files:
+            if not (fname.endswith('.md') or fname.endswith('.txt') or fname.endswith('.markdown')):
+                continue
+            note_path = os.path.join(root, fname)
+            try:
+                note_text = read_file(note_path)
+            except Exception:
+                continue
+
+            note_text = _convert_html_img_to_markdown(note_text)
+
+            for m in RE_MD_IMAGE.finditer(note_text):
+                raw = _normalize_local_image_ref(m.group(2))
+                if not raw or raw.startswith("http://") or raw.startswith("https://"):
+                    continue
+                abs_img = raw if os.path.isabs(raw) else os.path.normpath(os.path.join(root, raw))
+                refs.add(abs_img)
+
+            for raw in RE_WIKI_IMAGE.findall(note_text):
+                img = _normalize_local_image_ref(raw)
+                if not img or img.startswith("http://") or img.startswith("https://"):
+                    continue
+                abs_img = img if os.path.isabs(img) else os.path.normpath(os.path.join(root, img))
+                refs.add(abs_img)
+
+    return refs
+
+
+def _cleanup_root_orphan_images():
+    """Remove root-level images that are no longer referenced and already mirrored in BearImages."""
+    if not os.path.isdir(export_path):
+        return 0
+
+    referenced = _collect_referenced_local_images(export_path)
+
+    asset_basenames = set()
+    if os.path.isdir(assets_path):
+        for _, _, files in os.walk(assets_path):
+            asset_basenames.update(files)
+
+    removed = 0
+    try:
+        root_files = os.listdir(export_path)
+    except OSError:
+        return 0
+
+    for fname in root_files:
+        fpath = os.path.join(export_path, fname)
+        if not os.path.isfile(fpath):
+            continue
+        if not fname.lower().endswith(_IMAGE_FILE_EXTS):
+            continue
+        if fpath in referenced:
+            continue
+        if fname not in asset_basenames:
+            # Conservative: only remove when a canonical copy exists in BearImages.
+            continue
+        try:
+            os.remove(fpath)
+            removed += 1
+            write_log('Removed orphan root image: ' + fname)
+        except OSError:
+            pass
+    return removed
 
 
 def write_time_stamp():
     msg = "Markdown from Bear written at: " + datetime.datetime.now().strftime("%Y-%m-%d at %H:%M:%S")
-    write_file(export_ts_file, msg, 0, 0)
-    write_file(sync_ts_file_temp, msg, 0, 0)
+    write_file(export_ts_file_exp, msg, 0, 0)
+    write_file(sync_ts_file, msg, 0, 0)
 
 
 def hide_tags(md_text):
@@ -295,27 +491,44 @@ def restore_tags(md_text):
 # ===========================================================================
 
 def export_markdown():
-    temp_db_path = os.path.join(temp_path, 'database_copy.sqlite')
+    """Export notes from Bear directly into export_path (in-place).
+
+    Unchanged notes are skipped entirely (zero I/O).  Returns
+    (note_count, expected_paths) where expected_paths is a set of
+    absolute paths that should exist after this export — used by
+    _cleanup_stale_notes() to remove files no longer in Bear.
+    """
+    temp_fd, temp_db_path = tempfile.mkstemp(suffix='.sqlite',
+                                              prefix='bear_export_')
+    os.close(temp_fd)
     try:
         shutil.copy2(bear_db, temp_db_path)
     except Exception as e:
         print(f"Warning: could not copy database, reading live DB. Error: {e}")
+        os.remove(temp_db_path)
         temp_db_path = bear_db
 
     note_count = 0
+    expected_paths = set()
+
     try:
         with sqlite3.connect(temp_db_path) as conn:
             conn.row_factory = sqlite3.Row
-            # Select only the columns we actually use
             query = (
                 "SELECT ZTITLE, ZTEXT, ZCREATIONDATE, ZMODIFICATIONDATE, "
                 "       ZUNIQUEIDENTIFIER, Z_PK "
                 "FROM ZSFNOTE "
                 "WHERE ZTRASHED = 0 AND ZARCHIVED = 0"
             )
-            rows = conn.execute(query).fetchall()
+            # Use a dedicated cursor so that sub-queries inside the
+            # loop (image lookups in make_text_bundle /
+            # process_image_links) don't disturb the main iteration.
+            # This also avoids loading the entire result set — and
+            # every note's ZTEXT — into memory at once.
+            main_cursor = conn.cursor()
+            main_cursor.execute(query)
 
-            for row in rows:
+            for row in main_cursor:
                 title    = row['ZTITLE']
                 md_text  = row['ZTEXT'].rstrip()
                 creation = row['ZCREATIONDATE']
@@ -325,10 +538,10 @@ def export_markdown():
                 filename = clean_title(title)
 
                 if make_tag_folders:
-                    file_list = sub_path_from_tag(temp_path, filename, md_text)
+                    file_list = sub_path_from_tag(export_path, filename, md_text)
                 else:
                     is_excluded = any(("#" + tag) in md_text for tag in no_export_tags)
-                    file_list = [] if is_excluded else [os.path.join(temp_path, filename)]
+                    file_list = [] if is_excluded else [os.path.join(export_path, filename)]
 
                 if not file_list:
                     continue
@@ -346,62 +559,53 @@ def export_markdown():
                 for filepath in file_list:
                     note_count += 1
 
-                    # ── Incremental skip ─────────────────────────────────────
-                    # If the exported file already exists and its mtime >= this
-                    # note's Bear modification time, the note has not changed
-                    # since the last export.  Copy the existing output to temp
-                    # (so rsync keeps it) and skip the full regeneration
-                    # (image queries, text processing, etc.).
+                    # ── Incremental skip (in-place) ──────────────────────
+                    # File exists with mtime >= Bear mod time → up to date.
+                    # Record in manifest and skip — zero I/O.
                     if not export_as_textbundles:
-                        existing_md = filepath.replace(temp_path, export_path) + '.md'
-                        if (os.path.exists(existing_md)
-                                and os.path.getmtime(existing_md) >= mod_dt):
-                            shutil.copy2(existing_md, filepath + '.md')
+                        target_md = filepath + '.md'
+                        if (os.path.exists(target_md)
+                                and os.path.getmtime(target_md) >= mod_dt):
+                            expected_paths.add(target_md)
                             continue
                     else:
-                        dest_base   = filepath.replace(temp_path, export_path)
-                        existing_tb = dest_base + '.textbundle'
-                        existing_md = dest_base + '.md'
-                        if (os.path.isdir(existing_tb)
-                                and os.path.getmtime(existing_tb) >= mod_dt):
-                            dest_tb = filepath + '.textbundle'
-                            try:
-                                shutil.copytree(existing_tb, dest_tb)
-                                continue
-                            except Exception:
-                                # copytree can fail on duplicate cleaned
-                                # titles (FileExistsError), macOS resource
-                                # forks, etc.  Clean up any partial copy
-                                # and fall through to a full rebuild.
-                                if os.path.isdir(dest_tb):
-                                    shutil.rmtree(dest_tb)
-                        elif (os.path.exists(existing_md)
-                                and os.path.getmtime(existing_md) >= mod_dt):
-                            shutil.copy2(existing_md, filepath + '.md')
+                        target_tb = filepath + '.textbundle'
+                        target_md = filepath + '.md'
+                        if (os.path.isdir(target_tb)
+                                and os.path.getmtime(target_tb) >= mod_dt):
+                            expected_paths.add(target_tb)
+                            continue
+                        elif (os.path.exists(target_md)
+                                and os.path.getmtime(target_md) >= mod_dt):
+                            expected_paths.add(target_md)
                             continue
 
+                    # ── Full export (note is new or modified) ────────────
                     if export_as_textbundles:
                         if check_image_hybrid(md_text, filepath):
                             make_text_bundle(md_text, filepath, mod_dt, conn, pk)
+                            expected_paths.add(filepath + '.textbundle')
                         else:
                             write_file(filepath + '.md', md_text, mod_dt, creation)
+                            expected_paths.add(filepath + '.md')
                     elif export_image_repository:
                         md_proc = process_image_links(md_text, filepath, conn, pk)
                         write_file(filepath + '.md', md_proc, mod_dt, creation)
+                        expected_paths.add(filepath + '.md')
                     else:
                         write_file(filepath + '.md', md_text, mod_dt, creation)
+                        expected_paths.add(filepath + '.md')
     finally:
         if os.path.exists(temp_db_path) and temp_db_path != bear_db:
             os.remove(temp_db_path)
 
-    return note_count
+    return note_count, expected_paths
 
 
 def check_image_hybrid(md_text, filepath):
     if not export_as_hybrids:
         return True
-    dest_filepath = filepath.replace(temp_path, export_path)
-    if os.path.exists(dest_filepath + '.textbundle'):
+    if os.path.exists(filepath + '.textbundle'):
         return True
     return bool(RE_BEAR_IMAGE.search(md_text) or RE_MD_IMAGE.search(md_text))
 
@@ -466,13 +670,13 @@ def make_text_bundle(md_text, filepath, mod_dt, conn, pk):
     os.utime(bundle_path, (-1, mod_dt))
 
 
-def sub_path_from_tag(temp_path, filename, md_text):
+def sub_path_from_tag(base_path, filename, md_text):
     tags = []
     if multi_tag_folders:
         tags.extend(m[0] for m in RE_TAG_PATTERN1.findall(md_text))
         tags.extend(m[0] for m in RE_TAG_PATTERN2.findall(md_text))
         if not tags:
-            return [os.path.join(temp_path, filename)]
+            return [os.path.join(base_path, filename)]
     else:
         m1 = RE_TAG_PATTERN1.search(md_text)
         m2 = RE_TAG_PATTERN2.search(md_text)
@@ -483,10 +687,10 @@ def sub_path_from_tag(temp_path, filename, md_text):
         elif m2:
             tag = m2.group(1)
         else:
-            return [os.path.join(temp_path, filename)]
+            return [os.path.join(base_path, filename)]
         tags = [tag]
 
-    paths = [os.path.join(temp_path, filename)]
+    paths = [os.path.join(base_path, filename)]
     for tag in tags:
         if tag == '/':
             continue
@@ -496,7 +700,7 @@ def sub_path_from_tag(temp_path, filename, md_text):
         if any(tag.lower().startswith(nt.lower()) for nt in no_export_tags):
             return []
         sub_path = ('_' + tag[1:]) if tag.startswith('.') else tag
-        tag_path = os.path.join(temp_path, sub_path)
+        tag_path = os.path.join(base_path, sub_path)
         os.makedirs(tag_path, exist_ok=True)
         paths.append(os.path.join(tag_path, filename))
     return paths
@@ -593,6 +797,36 @@ def restore_image_links(md_text):
 # Import phase helpers
 # ===========================================================================
 
+_IMPORT_NOTE_SUFFIXES = ('.md', '.txt', '.markdown')
+_IMPORT_SKIP_DIRS = frozenset({
+    '.obsidian', 'BearImages', '.git', '__pycache__',
+})
+
+
+def _iter_changed_note_files(root_path, ts_last_sync):
+    """Yield (abs_path, mtime) for note files changed since *ts_last_sync*."""
+    for (root, dirnames, filenames) in os.walk(root_path):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _IMPORT_SKIP_DIRS
+                       and not d.startswith('.Ulysses')]
+        for filename in filenames:
+            if not filename.endswith(_IMPORT_NOTE_SUFFIXES):
+                continue
+            md_file = os.path.join(root, filename)
+            try:
+                ts = os.path.getmtime(md_file)
+            except OSError:
+                continue
+            if ts > ts_last_sync:
+                yield md_file, ts
+
+
+def _open_bear_db_readonly():
+    """Open Bear DB in read-only mode for repeated import lookups."""
+    conn = sqlite3.connect(f"file:{bear_db}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def sync_md_updates():
     if not os.path.exists(sync_ts_file) or not os.path.exists(export_ts_file_exp):
         return False
@@ -603,32 +837,51 @@ def sync_md_updates():
     current_sync_ts = time.time()
     update_sync_time_file(current_sync_ts)
 
-    # Build a vault-wide filename→path index once so per-image searches are O(1)
-    vault_index = _build_vault_index(export_path)
+    changed_files = list(_iter_changed_note_files(export_path, ts_last_sync))
+    if not changed_files:
+        return False
+
+    # Lazily build the vault-wide filename index only if image resolution needs it.
+    vault_index = None
+
+    def get_vault_index():
+        nonlocal vault_index
+        if vault_index is None:
+            vault_index = _build_vault_index(export_path)
+        return vault_index
+
+    # Keep one read-only SQLite connection for all import lookups in this cycle.
+    db_conn = None
+    try:
+        db_conn = _open_bear_db_readonly()
+    except Exception as e:
+        print(f"Warning: could not open read-only Bear DB connection: {e}")
+        db_conn = None
 
     updates_found = False
-    file_types    = ('*.md', '*.txt', '*.markdown')
 
-    for (root, dirnames, filenames) in os.walk(export_path):
-        if '.obsidian' in dirnames:
-            dirnames.remove('.obsidian')
-        for pattern in file_types:
-            for filename in fnmatch.filter(filenames, pattern):
-                md_file = os.path.join(root, filename)
-                ts      = os.path.getmtime(md_file)
-                if ts > ts_last_sync:
-                    if not updates_found:
-                        time.sleep(1)
-                    updates_found = True
-                    md_text = read_file(md_file)
-                    md_text = convert_ref_links_to_inline(md_text)
-                    backup_ext_note(md_file)
-                    if '.textbundle' in md_file:
-                        textbundle_to_bear(md_text, md_file, ts)
-                        write_log('Imported to Bear: ' + md_file)
-                    else:
-                        update_bear_note(md_text, md_file, ts, ts_last_export, vault_index)
-                        write_log('Bear Note Updated: ' + md_file)
+    def _process_one(md_file, ts):
+        md_text = read_file(md_file)
+        md_text = _convert_html_img_to_markdown(md_text)
+        md_text = convert_ref_links_to_inline(md_text)
+        backup_ext_note(md_file)
+        if '.textbundle' in md_file:
+            textbundle_to_bear(md_text, md_file, ts, db_conn=db_conn)
+            write_log('Imported to Bear: ' + md_file)
+        else:
+            update_bear_note(md_text, md_file, ts, ts_last_export,
+                             vault_index=get_vault_index, db_conn=db_conn)
+            write_log('Bear Note Updated: ' + md_file)
+
+    try:
+        for md_file, ts in changed_files:
+            if not updates_found:
+                time.sleep(1)
+            updates_found = True
+            _process_one(md_file, ts)
+    finally:
+        if db_conn is not None:
+            db_conn.close()
 
     return updates_found
 
@@ -640,8 +893,10 @@ def _build_vault_index(root_path):
     """
     index = {}
     for dirpath, dirnames, filenames in os.walk(root_path):
-        if '.obsidian' in dirnames:
-            dirnames.remove('.obsidian')
+        dirnames[:] = [d for d in dirnames
+                       if d != '.obsidian'
+                       and d != '.git'
+                       and d != '__pycache__']
         for fname in filenames:
             if fname not in index:
                 index[fname] = os.path.join(dirpath, fname)
@@ -652,13 +907,21 @@ def convert_ref_links_to_inline(md_text):
     refs = dict(RE_REF_DEF.findall(md_text))
     if not refs:
         return md_text
+    # Convert reference-style image links: ![alt][ref] and ![alt]
     md_text = RE_REF_IMG.sub(lambda m: f"![{m.group(1)}]({refs.get(m.group(2), m.group(2))})", md_text)
     md_text = RE_REF_IMP.sub(lambda m: f"![{m.group(1)}]({refs.get(m.group(1), m.group(1))})", md_text)
+    # Convert reference-style web links: [text][ref] and [text]
+    md_text = RE_REF_LINK.sub(lambda m: f"[{m.group(1)}]({refs.get(m.group(2), m.group(2))})", md_text)
+    md_text = RE_REF_LINK_IMP.sub(
+        lambda m: f"[{m.group(1)}]({refs[m.group(1)]})" if m.group(1) in refs else m.group(0),
+        md_text,
+    )
     md_text = RE_REF_CLEAN.sub('', md_text)
     return md_text
 
 
-def update_bear_note(md_text, md_file, ts, ts_last_export, vault_index=None):
+def update_bear_note(md_text, md_file, ts, ts_last_export,
+                     vault_index=None, db_conn=None):
     md_text = restore_tags(md_text)
     md_text = restore_image_links(md_text)
 
@@ -676,7 +939,7 @@ def update_bear_note(md_text, md_file, ts, ts_last_export, vault_index=None):
         md_text = md_text.lstrip() + '\n'
 
         # FIX: check conflict BEFORE uploading images (images update Bear's mod time)
-        sync_conflict = check_sync_conflict(uuid, ts_last_export)
+        sync_conflict = check_sync_conflict(uuid, ts_last_export, db_conn=db_conn)
         md_text       = process_md_images(md_text, md_file, uuid=uuid, vault_index=vault_index)
 
         if sync_conflict:
@@ -686,18 +949,18 @@ def update_bear_note(md_text, md_file, ts, ts_last_export, vault_index=None):
             x_create = 'bear://x-callback-url/create?show_window=no&open_note=no'
             bear_x_callback(x_create, md_text, message, '')
         else:
-            orig_title = backup_bear_note(uuid)
+            orig_title = backup_bear_note(uuid, db_conn=db_conn)
             x_replace  = ('bear://x-callback-url/add-text?show_window=no&open_note=no'
                           '&mode=replace_all&id=' + uuid)
             bear_x_callback(x_replace, md_text, '', orig_title)
     else:
         first_line    = next((l.strip() for l in md_text.splitlines() if l.strip()), '')
         note_title    = RE_MD_HEADING.sub('', first_line).strip()
-        recovered_uuid = lookup_uuid_by_title(note_title)
+        recovered_uuid = lookup_uuid_by_title(note_title, db_conn=db_conn)
 
         if recovered_uuid:
             md_text    = process_md_images(md_text, md_file, uuid=recovered_uuid, vault_index=vault_index)
-            orig_title = backup_bear_note(recovered_uuid)
+            orig_title = backup_bear_note(recovered_uuid, db_conn=db_conn)
             x_replace  = ('bear://x-callback-url/add-text?show_window=no&open_note=no'
                           '&mode=replace_all&id=' + recovered_uuid)
             bear_x_callback(x_replace, md_text, '', orig_title)
@@ -708,7 +971,7 @@ def update_bear_note(md_text, md_file, ts, ts_last_export, vault_index=None):
             bear_x_callback(x_create, md_text_tags, '', '')
             time.sleep(1.0)
 
-            new_uuid       = lookup_uuid_by_title(note_title)
+            new_uuid       = lookup_uuid_by_title(note_title, db_conn=db_conn)
             final_md_text  = process_md_images(md_text_tags, md_file, uuid=new_uuid,
                                                note_title=note_title, vault_index=vault_index)
 
@@ -731,10 +994,14 @@ def process_md_images(md_text, md_file, uuid=None, note_title=None, vault_index=
       - Otherwise upload the image to Bear via x-callback-url and rewrite the link
     vault_index: pre-built {filename: abs_path} map to avoid repeated os.walk calls.
     """
+    md_text = _convert_html_img_to_markdown(md_text)
     md_dir = os.path.dirname(md_file)
+    resolved_index = None
+    index_loaded = False
 
     def resolve_image_path(img_path_unquoted):
         """Return absolute path of the image, or None if not found."""
+        nonlocal resolved_index, index_loaded
         # 1. Relative to the markdown file's directory
         candidate = os.path.normpath(os.path.join(md_dir, img_path_unquoted))
         if os.path.exists(candidate):
@@ -743,12 +1010,15 @@ def process_md_images(md_text, md_file, uuid=None, note_title=None, vault_index=
         candidate = os.path.join(export_path, 'BearImages', os.path.basename(img_path_unquoted))
         if os.path.exists(candidate):
             return candidate
-        # 3. Vault-wide lookup via pre-built index
+        # 3. Vault-wide lookup via pre-built index (supports lazy callable)
+        if not index_loaded:
+            resolved_index = vault_index() if callable(vault_index) else vault_index
+            index_loaded = True
         target_name = os.path.basename(img_path_unquoted)
-        if vault_index and target_name in vault_index:
-            return vault_index[target_name]
-        # 4. Fallback: fresh os.walk (only triggered if vault_index not supplied)
-        if vault_index is None:
+        if resolved_index and target_name in resolved_index:
+            return resolved_index[target_name]
+        # 4. Fallback: fresh os.walk
+        if not resolved_index:
             for root, dirs, files in os.walk(export_path):
                 if '.obsidian' in dirs:
                     dirs.remove('.obsidian')
@@ -757,10 +1027,11 @@ def process_md_images(md_text, md_file, uuid=None, note_title=None, vault_index=
         return None
 
     def upload_and_format(alt_text, img_path):
-        if img_path.startswith('http'):
-            return f"![{alt_text}]({img_path})"
-
-        img_path_unquoted = urllib.parse.unquote(img_path)
+        img_path_unquoted = _normalize_local_image_ref(img_path)
+        if img_path_unquoted.startswith('http://') or img_path_unquoted.startswith('https://'):
+            return f"![{alt_text}]({img_path_unquoted})"
+        if not img_path_unquoted:
+            return f"![{alt_text}]({urllib.parse.quote(str(img_path))})"
         abs_img_path      = resolve_image_path(img_path_unquoted)
 
         if abs_img_path is None:
@@ -804,8 +1075,9 @@ def process_md_images(md_text, md_file, uuid=None, note_title=None, vault_index=
     return new_md
 
 
-def textbundle_to_bear(md_text, md_file, mod_dt):
+def textbundle_to_bear(md_text, md_file, mod_dt, db_conn=None):
     md_text = restore_tags(md_text)
+    md_text = _convert_html_img_to_markdown(md_text)
     bundle  = os.path.split(md_file)[0]
     uuid    = None
 
@@ -831,7 +1103,7 @@ def textbundle_to_bear(md_text, md_file, mod_dt):
     if not uuid:
         first_line = next((l.strip() for l in md_text.splitlines() if l.strip()), '')
         note_title = RE_MD_HEADING.sub('', first_line).strip()
-        uuid       = lookup_uuid_by_title(note_title)
+        uuid       = lookup_uuid_by_title(note_title, db_conn=db_conn)
 
     if uuid:
         id_tag = f"\n\n[//]: # ({{BearID:{uuid}}})\n"
@@ -842,7 +1114,10 @@ def textbundle_to_bear(md_text, md_file, mod_dt):
 
         # Normalise image paths to assets/ prefix for file writes
         def fix_image_path(m):
-            filename = urllib.parse.unquote(m.group(2)).split('/')[-1]
+            image_url = m.group(2)
+            if image_url.startswith("http"):
+                return m.group(0)  # Preserve web URLs as-is
+            filename = urllib.parse.unquote(image_url).split('/')[-1]
             return f"![{m.group(1)}](assets/{urllib.parse.quote(filename)})"
 
         fixed_md = RE_MD_IMAGE.sub(fix_image_path, clean_md)
@@ -864,18 +1139,76 @@ def textbundle_to_bear(md_text, md_file, mod_dt):
         assets_dir = os.path.join(bundle, 'assets')
         os.makedirs(assets_dir, exist_ok=True)
 
-        # Move any loose image files into assets/ and collect new ones to upload
-        new_images_to_upload = []
-        for m in RE_MD_IMAGE.finditer(clean_md):
-            img_filename = urllib.parse.unquote(m.group(2)).split('/')[-1]
-            loose_path   = os.path.join(bundle, img_filename)
-            asset_path   = os.path.join(assets_dir, img_filename)
-            if os.path.exists(loose_path) and not os.path.exists(asset_path):
-                shutil.copy2(loose_path, asset_path)
-            if not RE_IMAGE_UUID_PREFIX.match(img_filename) and os.path.exists(asset_path):
-                new_images_to_upload.append((img_filename, asset_path))
+        # Build current Bear attachment name sets for this note so we can
+        # distinguish "already exported from Bear" images from truly new TB
+        # inserts (even when filenames look UUID-like).
+        existing_bear_filenames = set()
+        existing_prefixed_names = set()
+        try:
+            q = (
+                "SELECT F.ZFILENAME, F.ZUNIQUEIDENTIFIER "
+                "FROM ZSFNOTEFILE F "
+                "JOIN ZSFNOTE N ON F.ZNOTE = N.Z_PK "
+                "WHERE N.ZUNIQUEIDENTIFIER = ? AND N.ZTRASHED = 0"
+            )
+            if db_conn is not None:
+                rows = db_conn.execute(q, (uuid,)).fetchall()
+            else:
+                with _open_bear_db_readonly() as conn:
+                    rows = conn.execute(q, (uuid,)).fetchall()
+            for row in rows:
+                fname = row["ZFILENAME"]
+                fuid = row["ZUNIQUEIDENTIFIER"]
+                if fname:
+                    existing_bear_filenames.add(fname)
+                if fname and fuid:
+                    existing_prefixed_names.add(f"{fuid}_{fname}")
+        except Exception as e:
+            print(f"Warning: could not read Bear attachments for {uuid}: {e}")
 
-        for filename, filepath in new_images_to_upload:
+        def resolve_tb_image_source(img_url):
+            """Resolve a local image source path for a textbundle note."""
+            ref = _normalize_local_image_ref(img_url)
+            if not ref:
+                return None, ""
+            basename = os.path.basename(ref)
+            candidates = []
+            if os.path.isabs(ref):
+                candidates.append(ref)
+            else:
+                candidates.append(os.path.normpath(os.path.join(bundle, ref)))
+                candidates.append(os.path.join(bundle, basename))
+                candidates.append(os.path.join(assets_dir, basename))
+                candidates.append(os.path.join(export_path, basename))
+                candidates.append(os.path.join(export_path, 'BearImages', basename))
+            for c in candidates:
+                if c and os.path.exists(c):
+                    return c, basename
+            return None, basename
+
+        # Move any loose image files into assets/ and collect new ones to upload.
+        # Deduplicate by filename so repeated references upload once.
+        new_images_to_upload = {}
+        for m in RE_MD_IMAGE.finditer(clean_md):
+            img_url = m.group(2)
+            if img_url.startswith("http://") or img_url.startswith("https://"):
+                continue  # Skip web URLs — not local assets
+            source_path, img_filename = resolve_tb_image_source(img_url)
+            if not img_filename:
+                continue
+            asset_path   = os.path.join(assets_dir, img_filename)
+            if source_path and source_path != asset_path and not os.path.exists(asset_path):
+                shutil.copy2(source_path, asset_path)
+            already_in_bear = (
+                img_filename in existing_bear_filenames
+                or img_filename in existing_prefixed_names
+            )
+            if not already_in_bear and os.path.exists(asset_path):
+                new_images_to_upload.setdefault(img_filename, asset_path)
+            elif source_path is None:
+                write_log('TB image missing: ' + img_url + '  in ' + md_file)
+
+        for filename, filepath in new_images_to_upload.items():
             try:
                 with open(filepath, "rb") as fh:
                     encoded = base64.b64encode(fh.read()).decode("utf-8")
@@ -887,13 +1220,23 @@ def textbundle_to_bear(md_text, md_file, mod_dt):
                 if url is not None:
                     NSWorkspace.sharedWorkspace().openURL_configuration_completionHandler_(url, open_config, None)
                     time.sleep(0.3)
+                    existing_bear_filenames.add(filename)
             except Exception as e:
                 print(f"Image upload failed for {filename}: {e}")
 
         # Build the Bear-formatted text (strip UUID prefix from filenames)
         def restore_img_format(m):
-            filename   = urllib.parse.unquote(m.group(2)).split('/')[-1]
-            clean_name = RE_UUID_FILENAME.sub('', filename)
+            image_url = m.group(2)
+            if image_url.startswith("http"):
+                return m.group(0)  # Preserve web URLs as-is
+            filename   = urllib.parse.unquote(image_url).split('/')[-1]
+            # Only strip UUID prefix for known Bear-exported attachment names.
+            # New TB inserts might also start with UUID-like text and must keep
+            # their full names so links continue to resolve.
+            if filename in existing_prefixed_names and '_' in filename:
+                clean_name = filename.split('_', 1)[1]
+            else:
+                clean_name = filename
             return f"![{m.group(1)}]({urllib.parse.quote(clean_name)})"
 
         bear_md = RE_MD_IMAGE.sub(restore_img_format, clean_md)
@@ -938,16 +1281,22 @@ def update_sync_time_file(ts):
 # Bear database helpers
 # ===========================================================================
 
-def check_sync_conflict(uuid, ts_last_export):
+def _fetchone_bear(query, params=(), db_conn=None):
+    """Run a single-row query on Bear DB, reusing *db_conn* when provided."""
+    if db_conn is not None:
+        return db_conn.execute(query, params).fetchone()
+    with _open_bear_db_readonly() as conn:
+        return conn.execute(query, params).fetchone()
+
+
+def check_sync_conflict(uuid, ts_last_export, db_conn=None):
     """Return True if Bear has modified the note since the last export."""
     try:
-        with sqlite3.connect(bear_db) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT ZMODIFICATIONDATE FROM ZSFNOTE "
-                "WHERE ZTRASHED = 0 AND ZUNIQUEIDENTIFIER = ?",
-                (uuid,)
-            ).fetchone()
+        row = _fetchone_bear(
+            "SELECT ZMODIFICATIONDATE FROM ZSFNOTE "
+            "WHERE ZTRASHED = 0 AND ZUNIQUEIDENTIFIER = ?",
+            (uuid,), db_conn=db_conn
+        )
         if row:
             return dt_conv(row['ZMODIFICATIONDATE']) > ts_last_export
     except Exception as e:
@@ -955,17 +1304,15 @@ def check_sync_conflict(uuid, ts_last_export):
     return False
 
 
-def backup_bear_note(uuid):
+def backup_bear_note(uuid, db_conn=None):
     """Back up the current Bear note to the sync_backup folder. Returns the note title."""
     title = ''
     try:
-        with sqlite3.connect(bear_db) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT ZTITLE, ZTEXT, ZMODIFICATIONDATE, ZCREATIONDATE "
-                "FROM ZSFNOTE WHERE ZUNIQUEIDENTIFIER = ?",
-                (uuid,)
-            ).fetchone()
+        row = _fetchone_bear(
+            "SELECT ZTITLE, ZTEXT, ZMODIFICATIONDATE, ZCREATIONDATE "
+            "FROM ZSFNOTE WHERE ZUNIQUEIDENTIFIER = ?",
+            (uuid,), db_conn=db_conn
+        )
 
         if not row:
             return title
@@ -992,18 +1339,16 @@ def backup_bear_note(uuid):
     return title
 
 
-def lookup_uuid_by_title(title):
+def lookup_uuid_by_title(title, db_conn=None):
     if not title:
         return None
     try:
-        with sqlite3.connect(bear_db) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT ZUNIQUEIDENTIFIER FROM ZSFNOTE "
-                "WHERE ZTRASHED = 0 AND ZARCHIVED = 0 AND ZTITLE = ? "
-                "ORDER BY ZMODIFICATIONDATE DESC LIMIT 1",
-                (title,)
-            ).fetchone()
+        row = _fetchone_bear(
+            "SELECT ZUNIQUEIDENTIFIER FROM ZSFNOTE "
+            "WHERE ZTRASHED = 0 AND ZARCHIVED = 0 AND ZTITLE = ? "
+            "ORDER BY ZMODIFICATIONDATE DESC LIMIT 1",
+            (title,), db_conn=db_conn
+        )
         if row:
             found_uuid = row['ZUNIQUEIDENTIFIER']
             write_log(f'UUID recovered via title lookup: "{title}" -> {found_uuid}')
