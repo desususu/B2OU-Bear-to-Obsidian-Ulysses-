@@ -121,8 +121,8 @@ Bear-Markdown-Export/
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/desususu/Bear-Markdown-Export.git
-cd Bear-Markdown-Export
+git clone https://github.com/desususu/B2OU-Bear-to-Obsidian-Ulysses-.git
+cd B2OU-Bear-to-Obsidian-Ulysses-
 
 # 2. 启动交互式向导
 bash run.sh
