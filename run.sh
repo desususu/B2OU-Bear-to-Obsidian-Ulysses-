@@ -634,7 +634,10 @@ except:
 " 2>/dev/null)
         
         if [[ -n "$cfg_vals" ]]; then
-            mapfile -t arr <<< "$cfg_vals"
+            local arr=()
+            while IFS= read -r _line; do
+                arr+=("$_line")
+            done <<< "$cfg_vals"
             [[ -n "${arr[0]:-}" ]] && c_script="${arr[0]}"
             [[ -n "${arr[1]:-}" ]] && c_python="${arr[1]}"
             [[ -n "${arr[2]:-}" ]] && c_md="${arr[2]}"
@@ -648,8 +651,9 @@ except:
     # Helper: prompt with current value shown
     _prompt_path() {
         local label="$1" current="$2"
-        echo -e "  ${BOLD}$(t "$label")${RESET}"
-        echo "  $(t cfg_current) $current"
+        # Print prompts to stderr so command substitution captures only the value.
+        echo -e "  ${BOLD}$(t "$label")${RESET}" >&2
+        echo "  $(t cfg_current) $current" >&2
         read -rp "  > " _val
         if [[ -z "$_val" ]]; then
             echo "$current"
