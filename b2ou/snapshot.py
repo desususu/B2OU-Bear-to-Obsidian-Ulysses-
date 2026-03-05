@@ -169,24 +169,23 @@ class VaultSnapshot:
 
     def compute_hashes(
         self, prev_hashes: Optional[dict] = None
-    ) -> dict[str, tuple[int, str]]:
+    ) -> dict[str, tuple[int, float, str]]:
         """
-        Return ``{rel_path: (size, hash)}`` for all notes.
+        Return ``{rel_path: (size, mtime, hash)}`` for all notes.
 
-        When *prev_hashes* is supplied files whose size is unchanged reuse
-        the cached hash (avoids ~90 % of I/O in typical "nothing changed"
-        cycles).
+        When *prev_hashes* is supplied files whose size and mtime are unchanged
+        reuse the cached hash.
         """
-        result: dict[str, tuple[int, str]] = {}
+        result: dict[str, tuple[int, float, str]] = {}
         for rel, entry in self.notes.items():
             if prev_hashes and rel in prev_hashes:
                 cached = prev_hashes[rel]
-                if isinstance(cached, (list, tuple)) and len(cached) >= 2:
-                    prev_sz, prev_hash = cached[0], cached[1]
-                    if entry.size == prev_sz and prev_hash:
-                        result[rel] = (entry.size, prev_hash)
+                if isinstance(cached, (list, tuple)) and len(cached) >= 3:
+                    prev_sz, prev_mtime, prev_hash = cached[0], cached[1], cached[2]
+                    if entry.size == prev_sz and abs(entry.mtime - float(prev_mtime)) < 0.001 and prev_hash:
+                        result[rel] = tuple(cached)
                         continue
-            result[rel] = (entry.size, _hash_file(entry.abs_path))
+            result[rel] = (entry.size, entry.mtime, _hash_file(entry.abs_path))
         return result
 
     # ── junk removal ─────────────────────────────────────────────────────
@@ -326,9 +325,9 @@ class ChangeDetector:
 
 def _hash_folder(
     folder: Path, prev: Optional[dict] = None
-) -> dict[str, tuple[int, str]]:
-    """Walk *folder* and return ``{rel_path: (size, hash)}`` for all notes."""
-    result: dict[str, tuple[int, str]] = {}
+) -> dict[str, tuple[int, float, str]]:
+    """Walk *folder* and return ``{rel_path: (size, mtime, hash)}`` for all notes."""
+    result: dict[str, tuple[int, float, str]] = {}
     if not folder.is_dir():
         return result
 
@@ -364,17 +363,20 @@ def _hash_folder(
 
 def _stat_hash_cached(
     path: Path, rel: str, prev: Optional[dict]
-) -> tuple[int, str]:
+) -> tuple[int, float, str]:
     try:
-        sz = path.stat().st_size
+        st = path.stat()
+        sz = st.st_size
+        mtime = st.st_mtime
     except OSError:
-        return (0, "")
+        return (0, 0.0, "")
 
     if prev and rel in prev:
         cached = prev[rel]
-        if isinstance(cached, (list, tuple)) and len(cached) >= 2:
-            prev_sz, prev_hash = cached[0], cached[1]
-            if sz == prev_sz and prev_hash:
-                return (sz, prev_hash)
+        if isinstance(cached, (list, tuple)) and len(cached) >= 3:
+            prev_sz, prev_mtime, prev_hash = cached[0], cached[1], cached[2]
+            if sz == prev_sz and abs(mtime - float(prev_mtime)) < 0.001 and prev_hash:
+                return tuple(cached)
 
-    return (sz, _hash_file(path))
+    return (sz, mtime, _hash_file(path))
+

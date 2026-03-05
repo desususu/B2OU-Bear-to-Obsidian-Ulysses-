@@ -190,26 +190,75 @@ def build_vault_index(root_path: Path) -> dict[str, Path]:
 # ---------------------------------------------------------------------------
 
 def iter_changed_note_files(
-    root_path: Path, ts_last_sync: float
+    root_path: Path, ts_last_sync: float, config: ExportConfig
 ) -> list[tuple[Path, float]]:
-    """Return list of ``(abs_path, mtime)`` for notes changed since *ts_last_sync*."""
+    """Return list of ``(abs_path, mtime)`` for notes changed since last sync."""
     results: list[tuple[Path, float]] = []
+
+    # 1. Attempt to load previous hashes from daemon state
+    state_file = Path.cwd() / ".b2ou_state.json"
+    prev_hashes: dict[str, tuple] = {}
+    if state_file.is_file():
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            key = "tb_hashes" if config.export_as_textbundles else "md_hashes"
+            prev_hashes = state.get("hashes", {}).get(key, {})
+        except Exception as exc:
+            log.warning("Could not read state for import hash comparison: %s", exc)
+
+    def _check_add(fpath: Path, rel: str) -> None:
+        try:
+            st = fpath.stat()
+            sz, mtime = st.st_size, st.st_mtime
+        except OSError:
+            return
+
+        if not prev_hashes:
+            if mtime > ts_last_sync:
+                results.append((fpath, mtime))
+            return
+
+        cached = prev_hashes.get(rel)
+        if not cached:
+            results.append((fpath, mtime))
+            return
+
+        from b2ou.snapshot import _hash_file
+        if isinstance(cached, (list, tuple)) and len(cached) >= 3:
+            prev_sz, prev_mtime, prev_hash = cached[0], cached[1], cached[2]
+            if sz == prev_sz and abs(mtime - float(prev_mtime)) < 0.001:
+                return
+
+        curr_hash = _hash_file(fpath)
+        cached_hash = cached[2] if len(cached) >= 3 else (cached[1] if len(cached) >= 2 else "")
+        if curr_hash == cached_hash:
+            return
+
+        results.append((fpath, mtime))
+
     for root, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [
             d for d in dirnames
-            if d not in IMPORT_SKIP_DIRS
-            and not d.startswith(".Ulysses")
+            if d not in IMPORT_SKIP_DIRS and not d.startswith(".Ulysses")
         ]
+        root_p = Path(root)
+
+        for d in list(dirnames):
+            if d.endswith(".textbundle"):
+                tb_dir = root_p / d
+                tb_text = tb_dir / "text.md"
+                if tb_text.is_file():
+                    _check_add(tb_text, str(tb_dir.relative_to(root_path)))
+                dirnames.remove(d)
+
         for fname in filenames:
             if not any(fname.endswith(ext) for ext in NOTE_EXTENSIONS):
                 continue
-            fpath = Path(root) / fname
-            try:
-                mtime = fpath.stat().st_mtime
-            except OSError:
+            if fname in (".sync-time.log", ".export-time.log", ".DS_Store"):
                 continue
-            if mtime > ts_last_sync:
-                results.append((fpath, mtime))
+            fpath = root_p / fname
+            _check_add(fpath, str(fpath.relative_to(root_path)))
+
     return results
 
 
@@ -571,7 +620,7 @@ def import_changed_notes(config: ExportConfig) -> bool:
     current_sync_ts = time.time()
     update_sync_timestamp(config, current_sync_ts)
 
-    changed = iter_changed_note_files(config.export_path, ts_last_sync)
+    changed = iter_changed_note_files(config.export_path, ts_last_sync, config)
     if not changed:
         return False
 

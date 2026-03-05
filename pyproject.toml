@@ -1,13 +1,13 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "b2ou"
 version = "5.0.0"
 description = "Bear to Obsidian / Ulysses sync toolkit"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
     { name = "rovest" },
@@ -35,7 +35,8 @@ dependencies = [
 [project.optional-dependencies]
 fast-hash = ["xxhash>=3.0"]
 daemon    = ["watchdog>=4.0"]
-all       = ["xxhash>=3.0", "watchdog>=4.0"]
+test      = ["pytest>=7.0"]
+all       = ["xxhash>=3.0", "watchdog>=4.0", "pytest>=7.0"]
 
 [project.scripts]
 b2ou = "b2ou.cli:main"

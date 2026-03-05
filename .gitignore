@@ -5,3 +5,16 @@ Trash/
 version/
 venv/
 .claude/
+
+# b2ou generated paths
+.b2ou_state.json*
+.b2ou.lock
+b2ou_config.json
+b2ou_gate.log
+
+# local sync directories
+Export/
+Backup/
+
+# python artifacts
+b2ou.egg-info/

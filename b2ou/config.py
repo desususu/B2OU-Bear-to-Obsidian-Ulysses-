@@ -76,8 +76,8 @@ class ExportConfig:
 
         if self.assets_path is None:
             self.assets_path = self.export_path / "BearImages"
-        else:
-            self.assets_path = Path(self.assets_path)
+        elif self.assets_path:
+            self.assets_path = Path(str(self.assets_path))
 
     # ── Derived flags (read-only) ─────────────────────────────────────────
 
@@ -115,7 +115,7 @@ class ExportConfig:
 # ---------------------------------------------------------------------------
 
 _SYNC_GATE_DEFAULTS: dict = {
-    "script_path":             "bear_export_sync.py",
+    "script_path":             "b2ou",
     "python_path":             "",
     "folder_md":               "./Export/MD_Export",
     "folder_tb":               "./Export/TB_Export",
